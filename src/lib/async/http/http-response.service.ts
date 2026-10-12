@@ -42,6 +42,11 @@ export class HttpResponseService {
     details: 'The resource requested could not be found on the server.'
   };
 
+  defaultError503 = <IErrorInfo>{
+    message: 'Maintenance in progress',
+    details: 'The system is briefly unavailable while an update is applied.'
+  };
+
   defaultError504 = <IErrorInfo>{
     message: 'Gateway Timeout!',
     details: 'Server is not responding, try again after sometime.'
@@ -82,6 +87,72 @@ export class HttpResponseService {
    * route. Cleared on the next successful response (see handleCartesianResponse).
    */
   private static readonly REDIRECT_ATTEMPTED_KEY = 'ct.auth.redirectAttempted';
+
+  /**
+   * sessionStorage key guarding against a RELOAD loop on 503.
+   *
+   * During a maintenance window Traefik answers every hostname in the zone
+   * from the maintenance responder at priority 900 -- the front ends included
+   * -- so a reload lands the user on the real maintenance page rather than an
+   * app that loads and then fails on every call. That makes reload the right
+   * response, and it needs no second maintenance screen kept in sync.
+   *
+   * But a 503 is not PROOF of a window. If one came from something else -- an
+   * overloaded backend, where the fe router still serves the app -- then
+   * reload -> app loads -> call 503s -> reload would spin forever. So reload at
+   * most once per page load. Cleared on the next successful response, exactly
+   * like the redirect guard below (see handleCartesianResponse).
+   */
+  private static readonly MAINTENANCE_RELOADED_KEY = 'ct.maintenance.reloaded';
+
+  /** How long the notice stays before reloading, so the user sees WHY the page
+   *  changed. An instant reload reads as a crash. */
+  private static readonly MAINTENANCE_RELOAD_DELAY_MS = 4000;
+
+  private clearMaintenanceGuard(): void {
+    try {
+      sessionStorage.removeItem(HttpResponseService.MAINTENANCE_RELOADED_KEY);
+    } catch {
+      // sessionStorage unavailable -- nothing to clear.
+    }
+  }
+
+  /**
+   * `Retry-After` is set by the maintenance responder (300s). Turned into
+   * something a person reads, and omitted rather than guessed at when absent.
+   */
+  private maintenanceError(response: HttpResponse<any>): IErrorInfo {
+    const error = <IErrorInfo>{ ...this.defaultError503 };
+    let after: string = null;
+    try {
+      after = response?.headers?.get('Retry-After');
+    } catch {
+      // Not every path through here carries headers.
+    }
+    const seconds = Number(after);
+    if (Number.isFinite(seconds) && seconds > 0) {
+      const minutes = Math.max(1, Math.round(seconds / 60));
+      error.details = `${error.details} Try again in about ${minutes} minute${minutes === 1 ? '' : 's'}.`;
+    } else {
+      error.details = `${error.details} It will return shortly.`;
+    }
+    return error;
+  }
+
+  private handleMaintenanceResponse(error: IErrorInfo): void {
+    this.showError(error);
+    try {
+      if (sessionStorage.getItem(HttpResponseService.MAINTENANCE_RELOADED_KEY)) {
+        return;     // already reloaded once for this page -- do not spin.
+      }
+      sessionStorage.setItem(HttpResponseService.MAINTENANCE_RELOADED_KEY, '1');
+    } catch {
+      // sessionStorage unavailable: show the notice and do NOT reload, because
+      // without the marker there is nothing to stop a loop.
+      return;
+    }
+    setTimeout(() => location.reload(), HttpResponseService.MAINTENANCE_RELOAD_DELAY_MS);
+  }
 
   private clearRedirectGuard(): void {
     try {
@@ -129,6 +200,9 @@ export class HttpResponseService {
       case 404:
         error = self.mergeError(self.defaultError404, errorInfo);
         break;
+      case 503:
+        error = self.mergeError(self.maintenanceError(response), errorInfo);
+        break;
       case 504:
         error = self.mergeError(self.defaultError504, errorInfo);
         break;
@@ -143,6 +217,9 @@ export class HttpResponseService {
 
     if(response.status === 401) {
       self.handleUnAuthorizedResponse(self.showError(error), redirectUrl ?? '/');
+    } else if (response.status === 503) {
+      this.logError(error);
+      self.handleMaintenanceResponse(error);
     } else {
       this.logError(error);
       self.showError(error);
@@ -208,6 +285,7 @@ export class HttpResponseService {
 
     } else {
       this.clearRedirectGuard();
+      this.clearMaintenanceGuard();
       const { data, meta, ...rest } = cartesianResponse;
       cloneResponse = response.clone({
         body: { data: data, meta: meta, ...rest }
