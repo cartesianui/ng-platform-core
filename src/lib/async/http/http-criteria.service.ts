@@ -201,6 +201,46 @@ export class RequestCriteria {
   //                     Helpers
   //-----------------------------------------------
 
+  /**
+   * Convert a criteria key for the API, treating a DOTTED key as a PATH rather than data.
+   *
+   * Q7-B12 (Admin-2): `ObjectUtils.convertKey` is dot-blind — it splits the whole string
+   * into words and rebuilds — so `accountingType.name` left here as
+   * `accounting_type.name`. The two halves are not the same kind of name:
+   *
+   *     accountingType . name
+   *     └─ relation ──┘  └ column ┘
+   *     an API allow-list key, verbatim    a data column, snake_case
+   *
+   * The relation segment is the literal string the repository declares as searchable
+   * (`'accountingType.name' => 'in'`), and the server hands it straight to Eloquent's
+   * `whereHas()`, which resolves it as a METHOD name. Snake-casing it asked for
+   * `accounting_type()`, which does not exist — the request was rejected and the Payment
+   * Voucher "Paid From" picker showed an empty list instead of an error.
+   *
+   * So: convert only the final segment, which really is a column. Leading segments pass
+   * through untouched, because they are contract identifiers, not data.
+   *
+   * Harmless for every other dotted field in use — `party.name`, `detail.mrn`,
+   * `customer.name`, `vendor.name`, `sku.name`, `country.name`, `register.code`,
+   * `product.categoryId` — because those relation names are single lowercase words that
+   * the conversion never altered anyway. `accountingType` is the only multi-word relation
+   * among the twenty declared across the API's repositories, which is why one picker broke
+   * and the mechanism looked sound.
+   */
+  private convertCriteriaKey(key: string): string {
+    const convert = (k: string) => ObjectUtils.convertKey(k, AppConfig.keysFormatAPP, AppConfig.keysFormatAPI);
+
+    if (!key.includes('.')) {
+      return convert(key);
+    }
+
+    const segments = key.split('.');
+    const column = segments.pop() as string;
+
+    return [...segments, convert(column)].join('.');
+  }
+
   private toCriteria(): Fields {
     const search: string[] = [];
     const searchFields: string[] = [];
@@ -210,7 +250,7 @@ export class RequestCriteria {
     const needsConvert = AppConfig.keysFormatAPI && AppConfig.keysFormatAPP && AppConfig.keysFormatAPI !== AppConfig.keysFormatAPP;
 
     this.wheres().forEach((condition) => {
-      const col = needsConvert ? ObjectUtils.convertKey(condition.column, AppConfig.keysFormatAPP, AppConfig.keysFormatAPI) : condition.column;
+      const col = needsConvert ? this.convertCriteriaKey(condition.column) : condition.column;
       // For 'between' and 'in' operators, values are arrays joined by comma.
       // Booleans need '1'/'0', not the literal words "true"/"false" — a
       // boolean DB column is a TINYINT, and MySQL's implicit string→number
@@ -226,7 +266,7 @@ export class RequestCriteria {
     });
 
     this.orders().forEach((order) => {
-      const col = needsConvert ? ObjectUtils.convertKey(order.column, AppConfig.keysFormatAPP, AppConfig.keysFormatAPI) : order.column;
+      const col = needsConvert ? this.convertCriteriaKey(order.column) : order.column;
       orderBy.push(col);
       sortedBy.push(order.direction);
     });
